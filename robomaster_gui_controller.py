@@ -18,6 +18,12 @@ except ImportError:
     print("="*40 + "\n错误: 缺少 'Pillow' 库。\n请运行: pip install Pillow\n" + "="*40)
     exit()
 
+try:
+    import pygame
+except ImportError:
+    print("="*40 + "\n警告: 缺少 'pygame' 库，手柄控制功能将不可用。\n请运行: pip install pygame\n" + "="*40)
+    pygame = None # 设置为None以便后续检查
+
 # 不再需要 h264decoder 和 numpy (numpy是cv2的依赖)
 
 class RoboMasterController(tk.Tk):
@@ -37,11 +43,14 @@ class RoboMasterController(tk.Tk):
         # self.video_sock = None # 不再需要手动管理视频socket
         self.is_connected = False
         self.is_video_on = False
+        self.control_mode = tk.StringVar(value="连续") # 新增：控制模式
+        self.is_gamepad_control_on = False           # 新增：手柄控制状态
 
         # 后台线程
         self.heartbeat_thread = None
         self.listen_thread = None
         self.video_thread = None
+        self.gamepad_thread = None                   # 新增：手柄线程
 
         self.create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -95,6 +104,21 @@ class RoboMasterController(tk.Tk):
         control_tabs.add(arm_tab, text='机械臂控制')
         
         # --- 基础控制选项卡 ---
+        
+        # --- 新增：模式选择 ---
+        mode_frame = ttk.LabelFrame(base_tab, text="控制模式", padding="10")
+        mode_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Radiobutton(mode_frame, text="连续", variable=self.control_mode, value="连续", command=self.on_control_mode_change).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="单次", variable=self.control_mode, value="单次", command=self.on_control_mode_change).pack(side=tk.LEFT, padx=5)
+        self.gamepad_radio = ttk.Radiobutton(mode_frame, text="手柄", variable=self.control_mode, value="手柄", command=self.on_control_mode_change)
+        self.gamepad_radio.pack(side=tk.LEFT, padx=5)
+        if not pygame:
+            self.gamepad_radio.config(state='disabled')
+
+        self.gamepad_status_label = ttk.Label(mode_frame, text="手柄: 未启动")
+        self.gamepad_status_label.pack(side=tk.RIGHT, padx=5)
+        
         control_frame = ttk.LabelFrame(base_tab, text="1. 机器人控制", padding="10")
         control_frame.pack(fill=tk.X)
         self.control_btn = ttk.Button(control_frame, text="开启控制 (获取控制权)", command=lambda: self.send_command("robot mode chassis_lead;"))
@@ -102,21 +126,21 @@ class RoboMasterController(tk.Tk):
 
         chassis_frame = ttk.LabelFrame(base_tab, text="2. 底盘控制", padding="10")
         chassis_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(chassis_frame, text="↑\n前进", command=lambda: self.send_command("chassis speed x 0.5 y 0 z 0;")).grid(row=0, column=1, sticky="ew")
-        ttk.Button(chassis_frame, text="↓\n后退", command=lambda: self.send_command("chassis speed x -0.5 y 0 z 0;")).grid(row=2, column=1, sticky="ew")
-        ttk.Button(chassis_frame, text="←\n左移", command=lambda: self.send_command("chassis speed x 0 y -0.5 z 0;")).grid(row=1, column=0, sticky="ew")
-        ttk.Button(chassis_frame, text="→\n右移", command=lambda: self.send_command("chassis speed x 0 y 0.5 z 0;")).grid(row=1, column=2, sticky="ew")
-        ttk.Button(chassis_frame, text="↺\n左旋", command=lambda: self.send_command("chassis speed x 0 y 0 z -90;")).grid(row=0, column=0, sticky="ew")
-        ttk.Button(chassis_frame, text="↻\n右旋", command=lambda: self.send_command("chassis speed x 0 y 0 z 90;")).grid(row=0, column=2, sticky="ew")
-        ttk.Button(chassis_frame, text="■\n停止", command=lambda: self.send_command("chassis speed x 0 y 0 z 0;")).grid(row=1, column=1, sticky="ew")
+        ttk.Button(chassis_frame, text="↑\n前进", command=lambda: self.handle_chassis_move(x=0.5, y=0, z=0)).grid(row=0, column=1, sticky="ew")
+        ttk.Button(chassis_frame, text="↓\n后退", command=lambda: self.handle_chassis_move(x=-0.5, y=0, z=0)).grid(row=2, column=1, sticky="ew")
+        ttk.Button(chassis_frame, text="←\n左移", command=lambda: self.handle_chassis_move(x=0, y=-0.5, z=0)).grid(row=1, column=0, sticky="ew")
+        ttk.Button(chassis_frame, text="→\n右移", command=lambda: self.handle_chassis_move(x=0, y=0.5, z=0)).grid(row=1, column=2, sticky="ew")
+        ttk.Button(chassis_frame, text="↺\n左旋", command=lambda: self.handle_chassis_move(x=0, y=0, z=-90)).grid(row=0, column=0, sticky="ew")
+        ttk.Button(chassis_frame, text="↻\n右旋", command=lambda: self.handle_chassis_move(x=0, y=0, z=90)).grid(row=0, column=2, sticky="ew")
+        ttk.Button(chassis_frame, text="■\n停止", command=lambda: self.handle_chassis_move(x=0, y=0, z=0)).grid(row=1, column=1, sticky="ew")
         for i in range(3): chassis_frame.columnconfigure(i, weight=1)
 
         gimbal_frame = ttk.LabelFrame(base_tab, text="3. 云台控制", padding="10")
         gimbal_frame.pack(fill=tk.X)
-        ttk.Button(gimbal_frame, text="↑\n向上", command=lambda: self.send_command("gimbal move p 10 y 0;")).grid(row=0, column=1, sticky="ew")
-        ttk.Button(gimbal_frame, text="↓\n向下", command=lambda: self.send_command("gimbal move p -10 y 0;")).grid(row=1, column=1, sticky="ew")
-        ttk.Button(gimbal_frame, text="←\n向左", command=lambda: self.send_command("gimbal move p 0 y -15;")).grid(row=1, column=0, sticky="ew")
-        ttk.Button(gimbal_frame, text="→\n向右", command=lambda: self.send_command("gimbal move p 0 y 15;")).grid(row=1, column=2, sticky="ew")
+        ttk.Button(gimbal_frame, text="↑\n向上", command=lambda: self.handle_gimbal_move(p=10, y=0)).grid(row=0, column=1, sticky="ew")
+        ttk.Button(gimbal_frame, text="↓\n向下", command=lambda: self.handle_gimbal_move(p=-10, y=0)).grid(row=1, column=1, sticky="ew")
+        ttk.Button(gimbal_frame, text="←\n向左", command=lambda: self.handle_gimbal_move(p=0, y=-15)).grid(row=1, column=0, sticky="ew")
+        ttk.Button(gimbal_frame, text="→\n向右", command=lambda: self.handle_gimbal_move(p=0, y=15)).grid(row=1, column=2, sticky="ew")
         ttk.Button(gimbal_frame, text="回中", command=lambda: self.send_command("gimbal recenter;")).grid(row=0, column=2, sticky="ew")
         for i in range(3): gimbal_frame.columnconfigure(i, weight=1)
         
@@ -203,6 +227,7 @@ class RoboMasterController(tk.Tk):
 
     def disconnect_robot(self):
         self.log("正在断开连接...")
+        if self.is_gamepad_control_on: self.toggle_gamepad_control() # 关闭手柄
         if self.is_video_on: self.stop_video_stream()
         if self.is_connected:
             self.send_command("robot mode free;")
@@ -233,8 +258,11 @@ class RoboMasterController(tk.Tk):
 
     def send_heartbeat(self):
         while self.is_connected:
-            time.sleep(10)
-            self.send_command("robot mode free;")
+            # RoboMaster的明文SDK要求5秒内必须有指令，否则会断开连接
+            # 同时，心跳指令不应使用 "robot mode free;"，因为它会释放控制权
+            # 这里我们使用一个无害的查询指令作为心跳
+            time.sleep(4)
+            self.send_command("robot get version;")
 
     def toggle_video_stream(self):
         if self.is_video_on:
@@ -331,6 +359,127 @@ class RoboMasterController(tk.Tk):
     def on_closing(self):
         self.disconnect_robot()
         self.destroy()
+
+    # --- 新增：控制模式处理 ---
+    def handle_chassis_move(self, x, y, z):
+        mode = self.control_mode.get()
+        if mode == "手柄":
+            self.log("请在手柄模式下使用手柄进行控制。")
+            return
+            
+        cmd = f"chassis speed x {x} y {y} z {z};"
+        self.send_command(cmd)
+
+        if mode == "单次" and (x != 0 or y != 0 or z != 0):
+            threading.Timer(0.2, lambda: self.send_command("chassis speed x 0 y 0 z 0;")).start()
+
+    def handle_gimbal_move(self, p, y):
+        mode = self.control_mode.get()
+        if mode == "手柄":
+            self.log("手柄模式暂不支持控制云台。")
+            return
+
+        cmd = f"gimbal move p {p} y {y};"
+        self.send_command(cmd)
+
+        if mode == "单次":
+            # 单次模式下，云台移动后不需要发停止指令
+            pass
+
+    def on_control_mode_change(self):
+        mode = self.control_mode.get()
+        self.log(f"控制模式已切换为: {mode}")
+        if mode == "手柄":
+            if not self.is_gamepad_control_on:
+                self.toggle_gamepad_control()
+        else:
+            if self.is_gamepad_control_on:
+                self.toggle_gamepad_control() # 关闭手柄控制
+
+    def toggle_gamepad_control(self):
+        if not pygame:
+            self.log("错误：pygame库未加载，无法使用手柄功能。")
+            return
+
+        if self.is_gamepad_control_on:
+            self.is_gamepad_control_on = False
+            self.log("手柄控制已关闭。")
+            self.gamepad_status_label.config(text="手柄: 未启动")
+        else:
+            self.is_gamepad_control_on = True
+            self.log("正在启动手柄控制...")
+            self.gamepad_thread = threading.Thread(target=self.gamepad_poll_loop, daemon=True)
+            self.gamepad_thread.start()
+
+    def gamepad_poll_loop(self):
+        """ 循环检测手柄输入并发送指令 """
+        pygame.init()
+        pygame.joystick.init()
+        joystick = None
+        
+        while self.is_gamepad_control_on:
+            # 1. 检测手柄连接
+            if not joystick:
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                if pygame.joystick.get_count() > 0:
+                    joystick = pygame.joystick.Joystick(0)
+                    joystick.init()
+                    self.log(f"已连接手柄: {joystick.get_name()}")
+                    self.gamepad_status_label.config(text=f"手柄: {joystick.get_name()}")
+                else:
+                    self.log("未检测到手柄，请连接...")
+                    self.gamepad_status_label.config(text="手柄: 未连接")
+                    time.sleep(2)
+                    continue
+            
+            # 2. 事件处理 (手柄插拔)
+            should_reconnect = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.is_gamepad_control_on = False
+                    break
+                if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                    joystick = None
+                    should_reconnect = True
+                    break
+            if should_reconnect: continue
+            if not self.is_gamepad_control_on: break
+
+            # 3. 获取摇杆数据并发送指令
+            # 左摇杆: axis 1 (Y, 上-1/下+1), axis 0 (X, 左-1/右+1) -> 前后/左右平移
+            # 右摇杆: axis 2 (X, 左-1/右+1) -> 左右旋转
+            dead_zone = 0.15
+
+            # 前后速度 (x) - Pygame Y轴向上为负，需反转
+            fwd_speed = -joystick.get_axis(1) if joystick.get_numaxes() > 1 else 0
+            if abs(fwd_speed) < dead_zone: fwd_speed = 0
+
+            # 左右平移速度 (y)
+            strafe_speed = joystick.get_axis(0) if joystick.get_numaxes() > 0 else 0
+            if abs(strafe_speed) < dead_zone: strafe_speed = 0
+
+            # 旋转速度 (z)
+            turn_speed = joystick.get_axis(2) if joystick.get_numaxes() > 2 else 0
+            if abs(turn_speed) < dead_zone: turn_speed = 0
+
+            # 将摇杆值 (-1.0 ~ 1.0) 映射到机器人速度
+            # 底盘速度: x(m/s), y(m/s), z(deg/s)
+            x_val = fwd_speed * 0.7   # 最大前进速度0.7m/s
+            y_val = strafe_speed * 0.7  # 最大平移速度0.7m/s
+            z_val = turn_speed * 180    # 最大旋转速度180deg/s
+            
+            cmd = f"chassis speed x {x_val:.2f} y {y_val:.2f} z {z_val:.2f};"
+            self.send_command(cmd)
+
+            time.sleep(0.1) # 每100ms发送一次指令
+
+        # 循环结束，停止机器人并退出pygame
+        if self.is_connected:
+            self.send_command("chassis speed x 0 y 0 z 0;")
+        pygame.quit()
+        self.log("手柄控制线程已安全退出。")
+
 
 if __name__ == '__main__':
     app = RoboMasterController()
