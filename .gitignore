@@ -61,7 +61,7 @@ target/
 *.out
 *.app
 
-dist/
+#dist/
 *.egg-info/
 *build*/
 testclip.h264
