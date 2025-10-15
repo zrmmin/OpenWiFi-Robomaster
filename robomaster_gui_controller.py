@@ -46,11 +46,25 @@ class RoboMasterController(tk.Tk):
         self.control_mode = tk.StringVar(value="连续") # 新增：控制模式
         self.is_gamepad_control_on = False           # 新增：手柄控制状态
 
-        # 后台线程
+        # 新增: 手柄轴绑定
+        self.axis_bindings = {
+            'forward': {'axis': 1, 'inverted': True},  # 前进/后退 (左摇杆Y, 默认反转)
+            'strafe':  {'axis': 0, 'inverted': True}, # 左/右移 (左摇杆X) - SDK Y轴与直觉相反, 默认反转
+            'turn':    {'axis': 2, 'inverted': False}  # 左/右旋 (右摇杆X) - 根据Xbox手柄在Windows上的常见映射修正
+        }
+        self.fwd_axis_var = tk.StringVar()
+        self.fwd_invert_var = tk.BooleanVar()
+        self.strafe_axis_var = tk.StringVar()
+        self.strafe_invert_var = tk.BooleanVar()
+        self.turn_axis_var = tk.StringVar()
+        self.turn_invert_var = tk.BooleanVar()
+        self.joystick = None # 新增：保存手柄对象
+
+
+        # 后台线程 (手柄线程已被移除)
         self.heartbeat_thread = None
         self.listen_thread = None
         self.video_thread = None
-        self.gamepad_thread = None                   # 新增：手柄线程
 
         self.create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -100,8 +114,10 @@ class RoboMasterController(tk.Tk):
         
         base_tab = ttk.Frame(control_tabs, padding=10)
         arm_tab = ttk.Frame(control_tabs, padding=10)
+        settings_tab = ttk.Frame(control_tabs, padding=10) # 新增
         control_tabs.add(base_tab, text='基础控制')
         control_tabs.add(arm_tab, text='机械臂控制')
+        control_tabs.add(settings_tab, text='手柄设置') # 新增
         
         # --- 基础控制选项卡 ---
         
@@ -128,8 +144,9 @@ class RoboMasterController(tk.Tk):
         chassis_frame.pack(fill=tk.X, pady=5)
         ttk.Button(chassis_frame, text="↑\n前进", command=lambda: self.handle_chassis_move(x=0.5, y=0, z=0)).grid(row=0, column=1, sticky="ew")
         ttk.Button(chassis_frame, text="↓\n后退", command=lambda: self.handle_chassis_move(x=-0.5, y=0, z=0)).grid(row=2, column=1, sticky="ew")
-        ttk.Button(chassis_frame, text="←\n左移", command=lambda: self.handle_chassis_move(x=0, y=-0.5, z=0)).grid(row=1, column=0, sticky="ew")
-        ttk.Button(chassis_frame, text="→\n右移", command=lambda: self.handle_chassis_move(x=0, y=0.5, z=0)).grid(row=1, column=2, sticky="ew")
+        # SDK的Y轴与直觉相反: 左移y为正, 右移y为负
+        ttk.Button(chassis_frame, text="←\n左移", command=lambda: self.handle_chassis_move(x=0, y=0.5, z=0)).grid(row=1, column=0, sticky="ew")
+        ttk.Button(chassis_frame, text="→\n右移", command=lambda: self.handle_chassis_move(x=0, y=-0.5, z=0)).grid(row=1, column=2, sticky="ew")
         ttk.Button(chassis_frame, text="↺\n左旋", command=lambda: self.handle_chassis_move(x=0, y=0, z=-90)).grid(row=0, column=0, sticky="ew")
         ttk.Button(chassis_frame, text="↻\n右旋", command=lambda: self.handle_chassis_move(x=0, y=0, z=90)).grid(row=0, column=2, sticky="ew")
         ttk.Button(chassis_frame, text="■\n停止", command=lambda: self.handle_chassis_move(x=0, y=0, z=0)).grid(row=1, column=1, sticky="ew")
@@ -160,6 +177,24 @@ class RoboMasterController(tk.Tk):
         gripper_frame.pack(fill=tk.X)
         ttk.Button(gripper_frame, text="张开", command=lambda: self.send_command("robotic_gripper open;")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
         ttk.Button(gripper_frame, text="闭合", command=lambda: self.send_command("robotic_gripper close;")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        # --- 新增: 手柄设置选项卡 ---
+        axis_display_frame = ttk.LabelFrame(settings_tab, text="实时轴数据", padding=10)
+        axis_display_frame.pack(fill=tk.X, expand=True)
+        self.axis_display_text = scrolledtext.ScrolledText(axis_display_frame, state='disabled', height=5)
+        self.axis_display_text.pack(fill=tk.BOTH, expand=True)
+
+        bindings_frame = ttk.LabelFrame(settings_tab, text="轴绑定", padding=10)
+        bindings_frame.pack(fill=tk.X, pady=5)
+        
+        self.fwd_combo = self._create_binding_row(bindings_frame, "前进/后退", self.fwd_axis_var, self.fwd_invert_var)
+        self.strafe_combo = self._create_binding_row(bindings_frame, "左移/右移", self.strafe_axis_var, self.strafe_invert_var)
+        self.turn_combo = self._create_binding_row(bindings_frame, "左旋/右旋", self.turn_axis_var, self.turn_invert_var)
+        
+        self.update_binding_vars_from_dict() # 用初始值填充UI
+
+        save_btn = ttk.Button(settings_tab, text="保存设置", command=self.save_axis_bindings)
+        save_btn.pack(fill=tk.X, pady=5)
 
         # --- 右侧-下：日志 ---
         log_frame = ttk.LabelFrame(control_panel, text="状态日志", padding="10")
@@ -240,13 +275,31 @@ class RoboMasterController(tk.Tk):
         self.set_controls_state('disabled')
 
     def send_command(self, cmd_str):
+        """ 发送指令到机器人 (线程安全日志) """
         if self.is_connected and self.control_sock:
             try:
-                self.log(f"发送: {cmd_str}")
+                # 日志记录必须在主线程中进行
+                is_main_thread = threading.current_thread() is threading.main_thread()
+                # 避免记录心跳指令刷屏
+                if "get version" not in cmd_str:
+                    log_msg = f"发送: {cmd_str}"
+                    if is_main_thread:
+                        self.log(log_msg)
+                    else:
+                        # 从后台线程安全地记录日志
+                        self.after(0, lambda: self.log(log_msg))
+
                 msg = cmd_str + ';' if not cmd_str.endswith(';') else cmd_str
                 self.control_sock.send(msg.encode('utf-8'))
             except Exception as e:
-                self.log(f"指令发送失败: {e}"); self.disconnect_robot()
+                log_msg = f"指令发送失败: {e}"
+                if threading.current_thread() is threading.main_thread():
+                    self.log(log_msg)
+                    self.disconnect_robot()
+                else:
+                    self.after(0, lambda: self.log(log_msg))
+                    self.after(0, self.disconnect_robot)
+
 
     def listen_for_responses(self):
         while self.is_connected:
@@ -360,17 +413,71 @@ class RoboMasterController(tk.Tk):
         self.disconnect_robot()
         self.destroy()
 
-    # --- 新增：控制模式处理 ---
+    # --- 新增：创建手柄绑定UI行 ---
+    def _create_binding_row(self, parent, text, axis_var, invert_var):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=text, width=12).pack(side=tk.LEFT)
+        combo = ttk.Combobox(frame, textvariable=axis_var, state="readonly", width=8)
+        combo.pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(frame, text="反转", variable=invert_var).pack(side=tk.LEFT)
+        return combo # Return combo to update its values later
+
+    # --- 新增：手柄绑定处理 ---
+    def update_binding_vars_from_dict(self):
+        """用字典中的值更新UI变量"""
+        self.fwd_axis_var.set(f"轴 {self.axis_bindings['forward']['axis']}")
+        self.fwd_invert_var.set(self.axis_bindings['forward']['inverted'])
+        self.strafe_axis_var.set(f"轴 {self.axis_bindings['strafe']['axis']}")
+        self.strafe_invert_var.set(self.axis_bindings['strafe']['inverted'])
+        self.turn_axis_var.set(f"轴 {self.axis_bindings['turn']['axis']}")
+        self.turn_invert_var.set(self.axis_bindings['turn']['inverted'])
+
+    def save_axis_bindings(self):
+        """从UI读取值并保存到字典"""
+        try:
+            self.axis_bindings['forward']['axis'] = int(self.fwd_axis_var.get().split(' ')[1])
+            self.axis_bindings['forward']['inverted'] = self.fwd_invert_var.get()
+            self.axis_bindings['strafe']['axis'] = int(self.strafe_axis_var.get().split(' ')[1])
+            self.axis_bindings['strafe']['inverted'] = self.strafe_invert_var.get()
+            self.axis_bindings['turn']['axis'] = int(self.turn_axis_var.get().split(' ')[1])
+            self.axis_bindings['turn']['inverted'] = self.turn_invert_var.get()
+            self.log("手柄轴绑定设置已保存。")
+        except Exception as e:
+            self.log(f"保存设置失败: {e}")
+
+
     def handle_chassis_move(self, x, y, z):
         mode = self.control_mode.get()
         if mode == "手柄":
             self.log("请在手柄模式下使用手柄进行控制。")
             return
             
-        cmd = f"chassis speed x {x} y {y} z {z};"
+        cmd = ""
+        # 针对按钮的纯平移指令，使用底层轮速控制以实现精确的麦轮运动
+        if x == 0 and z == 0 and y != 0:
+            speed = 200  # 一个合适的轮子转速 (rpm)
+            # SDK 轮子顺序: w1=右上, w2=左上, w3=左下, w4=右下
+            # 根据用户反馈"右侧的轮子是反的", 假设w1和w4电机方向与SDK指令相反
+            
+            # y > 0 为左移 (按钮)
+            if y > 0:
+                # 物理左移: w1(RF)后, w2(LF)前, w3(LR)后, w4(RR)前
+                # SDK指令:    w1(+)  w2(+)  w3(-)  w4(-)
+                cmd = f"chassis wheel w1 {speed} w2 {speed} w3 {-speed} w4 {-speed};"
+            # y < 0 为右移 (按钮)
+            else:
+                # 物理右移: w1(RF)前, w2(LF)后, w3(LR)前, w4(RR)后
+                # SDK指令:    w1(-)  w2(-)  w3(+)  w4(+)
+                cmd = f"chassis wheel w1 {-speed} w2 {-speed} w3 {speed} w4 {speed};"
+        else:
+            # 对于前进/后退/旋转，以及复合运动，继续使用高级速度指令
+            cmd = f"chassis speed x {x} y {y} z {z};"
+            
         self.send_command(cmd)
-
+        
         if mode == "单次" and (x != 0 or y != 0 or z != 0):
+            # 通用停止指令对两种模式都有效
             threading.Timer(0.2, lambda: self.send_command("chassis speed x 0 y 0 z 0;")).start()
 
     def handle_gimbal_move(self, p, y):
@@ -403,82 +510,124 @@ class RoboMasterController(tk.Tk):
 
         if self.is_gamepad_control_on:
             self.is_gamepad_control_on = False
+            self.joystick = None # 清理手柄对象
+            # 停止机器人
+            if self.is_connected:
+                self.send_command("chassis speed x 0 y 0 z 0;")
             self.log("手柄控制已关闭。")
             self.gamepad_status_label.config(text="手柄: 未启动")
+            # 退出pygame子系统
+            pygame.joystick.quit()
+            pygame.quit()
+
         else:
             self.is_gamepad_control_on = True
+            self.joystick = None # 重置手柄对象
             self.log("正在启动手柄控制...")
-            self.gamepad_thread = threading.Thread(target=self.gamepad_poll_loop, daemon=True)
-            self.gamepad_thread.start()
+            # 初始化pygame并开始轮询
+            pygame.init()
+            pygame.joystick.init()
+            # 启动轮询循环，由tkinter主线程驱动
+            self.poll_gamepad_state()
 
-    def gamepad_poll_loop(self):
-        """ 循环检测手柄输入并发送指令 """
-        pygame.init()
-        pygame.joystick.init()
-        joystick = None
-        
-        while self.is_gamepad_control_on:
-            # 1. 检测手柄连接
-            if not joystick:
-                pygame.joystick.quit()
-                pygame.joystick.init()
+
+    def poll_gamepad_state(self):
+        """
+        在Tkinter主循环中轮询手柄状态，取代后台线程。
+        """
+        # 如果已关闭手柄模式，则停止轮询
+        if not self.is_gamepad_control_on:
+            return
+
+        try:
+            pygame.event.get() # 必须调用以处理内部事件队列
+
+            # 1. 如果没有手柄对象，则尝试寻找并初始化
+            if self.joystick is None:
                 if pygame.joystick.get_count() > 0:
-                    joystick = pygame.joystick.Joystick(0)
-                    joystick.init()
-                    self.log(f"已连接手柄: {joystick.get_name()}")
-                    self.gamepad_status_label.config(text=f"手柄: {joystick.get_name()}")
+                    self.joystick = pygame.joystick.Joystick(0)
+                    self.joystick.init()
+                    name = self.joystick.get_name()
+                    num_axes = self.joystick.get_numaxes()
+                    self.log(f"已连接手柄: {name} ({num_axes}个轴)")
+                    self.gamepad_status_label.config(text=f"手柄: {name}")
+                    self.update_axis_comboboxes(num_axes)
                 else:
-                    self.log("未检测到手柄，请连接...")
                     self.gamepad_status_label.config(text="手柄: 未连接")
-                    time.sleep(2)
-                    continue
-            
-            # 2. 事件处理 (手柄插拔)
-            should_reconnect = False
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.is_gamepad_control_on = False
-                    break
-                if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
-                    joystick = None
-                    should_reconnect = True
-                    break
-            if should_reconnect: continue
-            if not self.is_gamepad_control_on: break
+                    self.after(2000, self.poll_gamepad_state) # 2秒后重试
+                    return
 
-            # 3. 获取摇杆数据并发送指令
-            # 左摇杆: axis 1 (Y, 上-1/下+1), axis 0 (X, 左-1/右+1) -> 前后/左右平移
-            # 右摇杆: axis 2 (X, 左-1/右+1) -> 左右旋转
+            # 2. 如果有手柄对象，则读取数据
+            num_axes = self.joystick.get_numaxes()
+            all_axes = [self.joystick.get_axis(i) for i in range(num_axes)]
+            self.update_axis_display(all_axes)
+
             dead_zone = 0.15
 
-            # 前后速度 (x) - Pygame Y轴向上为负，需反转
-            fwd_speed = -joystick.get_axis(1) if joystick.get_numaxes() > 1 else 0
+            fwd_axis = self.axis_bindings['forward']['axis']
+            fwd_speed = self.joystick.get_axis(fwd_axis) if num_axes > fwd_axis else 0
+            if self.axis_bindings['forward']['inverted']: fwd_speed = -fwd_speed
+
+            strafe_axis = self.axis_bindings['strafe']['axis']
+            strafe_speed = self.joystick.get_axis(strafe_axis) if num_axes > strafe_axis else 0
+            if self.axis_bindings['strafe']['inverted']: strafe_speed = -strafe_speed
+
+            turn_axis = self.axis_bindings['turn']['axis']
+            turn_speed = self.joystick.get_axis(turn_axis) if num_axes > turn_axis else 0
+            if self.axis_bindings['turn']['inverted']: turn_speed = -turn_speed
+
             if abs(fwd_speed) < dead_zone: fwd_speed = 0
-
-            # 左右平移速度 (y)
-            strafe_speed = joystick.get_axis(0) if joystick.get_numaxes() > 0 else 0
             if abs(strafe_speed) < dead_zone: strafe_speed = 0
-
-            # 旋转速度 (z)
-            turn_speed = joystick.get_axis(2) if joystick.get_numaxes() > 2 else 0
             if abs(turn_speed) < dead_zone: turn_speed = 0
 
-            # 将摇杆值 (-1.0 ~ 1.0) 映射到机器人速度
-            # 底盘速度: x(m/s), y(m/s), z(deg/s)
-            x_val = fwd_speed * 0.7   # 最大前进速度0.7m/s
-            y_val = strafe_speed * 0.7  # 最大平移速度0.7m/s
-            z_val = turn_speed * 180    # 最大旋转速度180deg/s
-            
-            cmd = f"chassis speed x {x_val:.2f} y {y_val:.2f} z {z_val:.2f};"
+            cmd = ""
+            # 如果是纯平移运动, 使用底层轮速控制以获得精确的麦轮运动
+            if fwd_speed == 0 and turn_speed == 0 and strafe_speed != 0:
+                max_rpm = 200
+                # 根据摇杆幅度调整转速
+                rpm = abs(strafe_speed * max_rpm)
+                
+                # strafe_speed > 0 为左移
+                if strafe_speed > 0:
+                    # 物理左移: w1(RF)后, w2(LF)前, w3(LR)后, w4(RR)前
+                    # SDK指令(右侧电机反向): w1(+)  w2(+)  w3(-)  w4(-)
+                    cmd = f"chassis wheel w1 {rpm:.0f} w2 {rpm:.0f} w3 {-rpm:.0f} w4 {-rpm:.0f};"
+                # strafe_speed < 0 为右移
+                else:
+                    # 物理右移: w1(RF)前, w2(LF)后, w3(LR)前, w4(RR)后
+                    # SDK指令(右侧电机反向): w1(-)  w2(-)  w3(+)  w4(+)
+                    cmd = f"chassis wheel w1 {-rpm:.0f} w2 {-rpm:.0f} w3 {rpm:.0f} w4 {rpm:.0f};"
+            else:
+                # 对于复合运动或纯前进/旋转, 继续使用高级速度指令
+                x_val = fwd_speed * 0.7
+                y_val = strafe_speed * 0.7
+                z_val = turn_speed * 180
+                cmd = f"chassis speed x {x_val:.2f} y {y_val:.2f} z {z_val:.2f};"
+
             self.send_command(cmd)
 
-            time.sleep(0.1) # 每100ms发送一次指令
+        except pygame.error as e:
+            self.log(f"手柄错误 (可能已断开): {e}")
+            self.joystick = None # 清空手柄对象，以便下次轮询时重新寻找
+            self.gamepad_status_label.config(text="手柄: 未连接")
 
-        # 循环结束，停止机器人并退出pygame
-        if self.is_connected:
-            self.send_command("chassis speed x 0 y 0 z 0;")
-        pygame.quit()
-        self.log("手柄控制线程已安全退出。")
+        # 安排下一次轮询
+        self.after(100, self.poll_gamepad_state)
+
+    def update_axis_comboboxes(self, num_axes):
+        """更新轴选择下拉菜单"""
+        axis_list = [f"轴 {i}" for i in range(num_axes)]
+        self.fwd_combo['values'] = axis_list
+        self.strafe_combo['values'] = axis_list
+        self.turn_combo['values'] = axis_list
+
+    def update_axis_display(self, all_axes):
+        """更新实时轴数据"""
+        text = " ".join([f"轴{i}: {v: .2f}" for i, v in enumerate(all_axes)])
+        self.axis_display_text.config(state='normal')
+        self.axis_display_text.delete('1.0', tk.END)
+        self.axis_display_text.insert('1.0', text)
+        self.axis_display_text.config(state='disabled')
 
 
 if __name__ == '__main__':

@@ -1,125 +1,63 @@
-H264 Decoder Python Module
-==========================
+# RoboMaster GUI Controller (明文SDK - TCP模式)
 
-![Master branch status](https://github.com/DaWelter/h264decoder/actions/workflows/python-package.yml/badge.svg?branch=master)
+这是一个使用 Python `tkinter` 库编写的图形化界面，用于通过大疆 RoboMaster EP/S1 的明文SDK（TCP模式）来控制机器人。
 
-The aim of this project is to provide a simple decoder for video
-captured by a Raspberry Pi camera. At the time of this writing I only
-need H264 decoding, since a H264 stream is what the RPi software 
-delivers. Furthermore flexibility to incorporate the decoder in larger
-python programs in various ways is desirable.
+## 主要功能
 
-The code might also serve as example for libav and pybind11 usage.
+- **图形化界面**: 提供了一个用户友好的界面来控制机器人，无需编写代码。
+- **多平台兼容**: 基于Python和Tkinter，理论上可以在Windows, macOS, 和 Linux上运行。
+- **实时视频流**: 可以在界面上实时显示来自机器人摄像头的第一视角画面。
+- **模块化控制**: 将不同的控制功能（如连接、底盘、云台、机械臂）划分到不同的区域，方便操作。
 
-Examples
---------
-You can do something like this
-```python
-import h264decoder
-import numpy as np
+## 新增功能 (本次更新)
 
-f = open(thefile, 'rb')
-decoder = h264decoder.H264Decoder()
-while 1:
-  data_in = f.read(1024)
-  if not data_in:
-    break
-  framedatas = decoder.decode(data_in)
-  for framedata in framedatas:
-    (frame, w, h, ls) = framedata
-    if frame is not None:
-        #print('frame size %i bytes, w %i, h %i, linesize %i' % (len(frame), w, h, ls))
-        frame = np.frombuffer(frame, dtype=np.ubyte, count=len(frame))
-        frame = frame.reshape((h, ls//3, 3))
-        frame = frame[:,:w,:]
-        # At this point `frame` references your usual height x width x rgb channels numpy array of unsigned bytes.
-```
-There are simple demo programs in the ```examples``` folder. ```display_frames.py``` is probably the one you want to take a look at.
+本次更新对控制器进行了大幅重构和功能增强，主要包括：
 
-Requirements
-------------
+1.  **多种控制模式**:
+    *   **连续模式**: 按下按钮后机器人会持续运动，直到按下停止。
+    *   **单次模式**: 按下按钮后机器人会执行一个短暂动作后自动停止，适合微调。
+    *   **手柄模式**: 支持使用游戏手柄（如Xbox手柄）进行更流畅的控制。
 
-* Python 3
-* cmake for building
-* libav / ffmpeg (swscale, avutil and avcodec)
-* pybind11 (will be automatically downloaded from github if not found)
+2.  **高级手柄支持**:
+    *   **自定义轴绑定**: 在“手柄设置”中，可以为前进/后退、左/右平移、左/右旋转等动作自由绑定手柄的任意轴。
+    *   **反转轴向**: 支持一键反转任意轴的方向，以适应不同手柄的摇杆习惯。
+    *   **实时轴数据显示**: 实时显示手柄所有轴的数值，方便用户进行调试和绑定。
+    *   **智能平移控制**: 在手柄模式下，纯粹的左右平移会自动切换到底层的轮速指令，实现最精确的麦克纳姆轮运动。
 
-For the example scripts
+3.  **连接稳定性优化**:
+    *   修复了之前版本中因心跳间隔过长和指令不当导致的连接中断问题，现在可以保持长时间的稳定控制。
 
-* matplotlib
-* numpy
+## 使用方法
 
-I tested it on
+1.  **环境配置**:
+    *   确保您的电脑上已安装 Python 3.x。
+    *   进入虚拟环境 (推荐):
+        ```bash
+        # (Windows PowerShell)
+        .\venv\Scripts\Activate.ps1
+        ```
+    *   安装所有必需的依赖库:
+        ```bash
+        pip install -r requirements.txt
+        ```
+        特别注意，手柄功能需要 `pygame` 库，如果 `requirements.txt` 中没有，请手动安装: `pip install pygame`
 
-* Ubuntu 18, gcc 9, Anaconda environment with Python 3.7, Libav from Ubuntu repo.
-* Windows 10, Visual Studio Community 2017, Anaconda environment with Python 3.7, FFMPEG from vcpkg.
+2.  **机器人连接**:
+    *   将您的电脑和RoboMaster机器人连接到同一个局域网下。
+    *   确保机器人已开启明文SDK端口。
 
-Building and Installing
------------------------
+3.  **运行程序**:
+    ```bash
+    python robomaster_gui_controller.py
+    ```
 
-### Windows
+4.  **操作**:
+    *   在界面中输入机器人的IP地址，点击“连接”。
+    *   连接成功后，点击“开启视频”以查看画面。
+    *   在“基础控制”选项卡中选择您喜欢的控制模式（连续/单次/手柄）进行操作。
+    *   如果使用手柄，可以先到“手柄设置”选项卡中进行轴绑定。
 
-The suggested way to obtain ffmpeg is through [vcpkg](https://github.com/microsoft/vcpkg). Assuming all the setup including VC integration has been done, we can install the x64 libraries with
-
-```cmd
-vcpkg.exe install ffmpeg:x64-windows
-```
-
-We can build the extension module with setuptools almost normally. However cmake is used internally and we have to let it know the search paths to our libs. Hence the additional ```--cmake-args``` argument with the toolchain file as per vcpkg instructions.
-
-```bash
-python setup.py build_ext --cmake-args="-DCMAKE_TOOLCHAIN_FILE=[path to vcpkg]/scripts/buildsystems/vcpkg.cmake"
-pip install -e .
-```
-
-The ```-e``` option installs symlinks to the build directory. Useful for development. Leave it out otherwise.
-
-----------------------------------------------
-
-Alternatively one can build the extension module manually with cmake.
-From the project directory:
-```cmd
-mkdir [build dir name]
-cd [build dir name]
-cmake -DCMAKE_TOOLCHAIN_FILE=[path to vcpkg]/scripts/buildsystems/vcpkg.cmake -A x64 ..
-cmake --build .
-```
-
-### Linux
-
-Should be a matter of installing the libav or ffmpeg libraries. On Debian or Ubuntu:
-
-```bash
-sudo apt install libswscale-dev libavcodec-dev libavutil-dev
-```
-
-And then running
-
-```bash
-pip install .
-```
-
-in the project directory.
-
-
-History
--------
-
-### v2
-
-For Python 3. Switch to PyBind11. Module renamed from libh264decoder to h264decoder! Support installation via setuptools.
-
-### v1
-
-For Python 2.7. Depends on Boost Python. Project/Build file generation with CMake.
-
-
-Credits
--------
-
-* [Michael Welter](https://github.com/DaWelter). Original author.
-* [Martin Valgur](https://github.com/valgur).  Switch to pybind11, nice build configuration and more.
-
-License
--------
-The code is published under the Mozilla Public License v. 2.0. 
+## 注意事项
+-   请确保您的防火墙允许程序访问网络，以便与机器人进行TCP通信。
+-   手柄功能依赖 `pygame` 库，如果未安装，程序会提示且该功能将被禁用。
+-   默认的手柄轴绑定是基于Windows下的Xbox手柄设置的，如果您的手柄不适用，请务必使用“手柄设置”功能进行自定义。 
